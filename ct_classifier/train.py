@@ -40,7 +40,7 @@ def create_dataloader(cfg, split='train'):
 
 
 
-def load_model(cfg):
+def load_model_optim_scaler(cfg):
     '''
         Creates a model instance and loads the latest model state weights.
     '''
@@ -48,6 +48,15 @@ def load_model(cfg):
 
     # load latest model state
     model_states = glob.glob('model_states/*.pt')
+
+    # set up model optimizer
+    optim = setup_optimizer(cfg, model_instance)
+
+    # Gradient scaling helps prevent gradients with small magnitudes from flushing to zero (“underflowing”)
+    # when training with mixed precision. See: https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
+    # Recommended to use one Scaler for the entire run
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.get('use_amp', False))
+
     if len(model_states):
         # at least one save state found; get latest
         model_epochs = [int(m.replace('model_states/','').replace('.pt','')) for m in model_states]
@@ -57,22 +66,25 @@ def load_model(cfg):
         print(f'Resuming from epoch {start_epoch}')
         state = torch.load(open(f'model_states/{start_epoch}.pt', 'rb'), map_location='cpu')
         model_instance.load_state_dict(state['model'])
-
+        optim.load_state_dict(state['optim'])
+        scaler.load_state_dict(state['scaler'])
     else:
         # no save state found; start anew
         print('Starting new model')
         start_epoch = 0
 
-    return model_instance, start_epoch
+    return model_instance, optim, scaler, start_epoch
 
 
 
-def save_model(cfg, epoch, model, stats):
+def save_model(cfg, epoch, model, optim, scaler, stats):
     # make sure save directory exists; create if not
     os.makedirs('model_states', exist_ok=True)
 
     # get model parameters and add to stats...
     stats['model'] = model.state_dict()
+    stats['optim'] = optim.state_dict()
+    stats['scaler'] = scaler.state_dict()
 
     # ...and save
     torch.save(stats, open(f'model_states/{epoch}.pt', 'wb'))
@@ -97,7 +109,7 @@ def setup_optimizer(cfg, model):
 
 
 
-def train(cfg, dataLoader, model, optimizer):
+def train(cfg, dataLoader, model, optimizer, scaler):
     '''
         Our actual training function.
     '''
@@ -140,20 +152,28 @@ def train(cfg, dataLoader, model, optimizer):
         dataloader_time += (now - last_time)
         last_time = now
 
-        # forward pass
-        prediction = model(data)
+        with torch.autocast(device_type=device, dtype=torch.float16, enabled=cfg.get('use_amp', False)):
+            # forward pass
+            prediction = model(data)
+
+            # loss
+            loss = criterion(prediction, labels)
+
+        # backward pass (calculate gradients of current batch)
+        # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
+        scaler.scale(loss).backward()
+
+        # apply gradients to model parameters
+        # scaler.step() first unscales the gradients of the optimizer's assigned params.
+        # If these gradients do not contain infs or NaNs, optimizer.step() is then called,
+        # otherwise, optimizer.step() is skipped.
+        scaler.step(optimizer)
+
+        # Updates the scale for next iteration.
+        scaler.update()
 
         # reset gradients to zero
         optimizer.zero_grad()
-
-        # loss
-        loss = criterion(prediction, labels)
-
-        # backward pass (calculate gradients of current batch)
-        loss.backward()
-
-        # apply gradients to model parameters
-        optimizer.step()
 
         # prediction is complete
         now = time_sync()
@@ -235,7 +255,8 @@ def validate(cfg, dataLoader, model):
             last_time = now
 
             # forward pass
-            prediction = model(data)
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=cfg.get('use_amp', False)):
+                prediction = model(data)
 
             # loss
             loss = criterion(prediction, labels)
@@ -289,6 +310,7 @@ def main():
     # load config
     print(f'Using config "{args.config}"')
     cfg = yaml.safe_load(open(args.config, 'r'))
+    print(cfg)
 
     # init random number generator seed (set at the start)
     init_seed(cfg.get('seed', None))
@@ -304,10 +326,7 @@ def main():
     dl_val = create_dataloader(cfg, split='val')
 
     # initialize model
-    model, current_epoch = load_model(cfg)
-
-    # set up model optimizer
-    optim = setup_optimizer(cfg, model)
+    model, optim, scaler, current_epoch = load_model_optim_scaler(cfg)
 
     # we have everything now: data loaders, model, optimizer; let's do the epochs!
     numEpochs = cfg['num_epochs']
@@ -315,7 +334,7 @@ def main():
         current_epoch += 1
         print(f'Epoch {current_epoch}/{numEpochs}')
 
-        loss_train, oa_train = train(cfg, dl_train, model, optim)
+        loss_train, oa_train = train(cfg, dl_train, model, optim, scaler)
         loss_val, oa_val = validate(cfg, dl_val, model)
 
         # combine stats and save
@@ -325,7 +344,7 @@ def main():
             'oa_train': oa_train,
             'oa_val': oa_val
         }
-        save_model(cfg, current_epoch, model, stats)
+        save_model(cfg, current_epoch, model, optim, scaler, stats)
     
 
     # That's all, folks!
