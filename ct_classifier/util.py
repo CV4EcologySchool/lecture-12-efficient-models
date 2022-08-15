@@ -5,6 +5,7 @@
 '''
 
 import random
+import time
 import torch
 from torch.backends import cudnn
 
@@ -22,3 +23,11 @@ def init_seed(seed):
         torch.cuda.manual_seed(seed)
         cudnn.benchmark = True
         cudnn.deterministic = True
+
+def time_sync():
+    '''
+        Pytorch-accurate time. See: https://discuss.pytorch.org/t/how-to-measure-time-in-pytorch/26964
+    '''
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()

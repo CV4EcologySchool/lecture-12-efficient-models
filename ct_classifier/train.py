@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torch.optim import SGD
 
 # let's import our own classes and functions!
-from util import init_seed
+from util import init_seed, time_sync
 from dataset import CTDataset
 from model import CustomResNet18
 
@@ -118,12 +118,27 @@ def train(cfg, dataLoader, model, optimizer):
     # running averages
     loss_total, oa_total = 0.0, 0.0                         # for now, we just log the loss and overall accuracy (OA)
 
+    # time each component
+    dataloader_time = 0.0
+    model_time = 0.0
+    postprocessing_time = 0.0
+
     # iterate over dataLoader
     progressBar = trange(len(dataLoader))
+
+    # start timing the dataloader now - each iteration in the for loop
+    # calls next(dataLoader), so we need to time its execution
+    last_time = time_sync()
+
     for idx, (data, labels) in enumerate(dataLoader):       # see the last line of file "dataset.py" where we return the image tensor (data) and label
 
         # put data and labels on device
         data, labels = data.to(device), labels.to(device)
+
+        # data loading is complete
+        now = time_sync()
+        dataloader_time += (now - last_time)
+        last_time = now
 
         # forward pass
         prediction = model(data)
@@ -140,6 +155,11 @@ def train(cfg, dataLoader, model, optimizer):
         # apply gradients to model parameters
         optimizer.step()
 
+        # prediction is complete
+        now = time_sync()
+        model_time += (now - last_time)
+        last_time = now
+
         # log statistics
         loss_total += loss.item()                       # the .item() command retrieves the value of a single-valued tensor, regardless of its data type and device of tensor
 
@@ -154,11 +174,20 @@ def train(cfg, dataLoader, model, optimizer):
             )
         )
         progressBar.update(1)
+
+        # postprocessing is complete
+        now = time_sync()
+        postprocessing_time += (now - last_time)
+        last_time = now
     
     # end of epoch; finalize
     progressBar.close()
     loss_total /= len(dataLoader)           # shorthand notation for: loss_total = loss_total / len(dataLoader)
     oa_total /= len(dataLoader)
+
+    print("Dataloader time in seconds:", "%.2f" % dataloader_time)
+    print("Model time in seconds:", "%.2f" % model_time)
+    print("Postprocessing time in seconds:", "%.2f" % postprocessing_time)
 
     return loss_total, oa_total
 
@@ -182,20 +211,39 @@ def validate(cfg, dataLoader, model):
     # running averages
     loss_total, oa_total = 0.0, 0.0     # for now, we just log the loss and overall accuracy (OA)
 
+    # time each component
+    dataloader_time = 0.0
+    model_time = 0.0
+    postprocessing_time = 0.0
+
     # iterate over dataLoader
     progressBar = trange(len(dataLoader))
     
+    # start timing the dataloader now - each iteration in the for loop
+    # calls next(dataLoader), so we need to time its execution
+    last_time = time_sync()
+
     with torch.no_grad():               # don't calculate intermediate gradient steps: we don't need them, so this saves memory and is faster
         for idx, (data, labels) in enumerate(dataLoader):
 
             # put data and labels on device
             data, labels = data.to(device), labels.to(device)
 
+            # data loading is complete
+            now = time_sync()
+            dataloader_time += (now - last_time)
+            last_time = now
+
             # forward pass
             prediction = model(data)
 
             # loss
             loss = criterion(prediction, labels)
+
+            # prediction is complete
+            now = time_sync()
+            model_time += (now - last_time)
+            last_time = now 
 
             # log statistics
             loss_total += loss.item()
@@ -211,11 +259,20 @@ def validate(cfg, dataLoader, model):
                 )
             )
             progressBar.update(1)
+
+            # postprocessing is complete
+            now = time_sync()
+            postprocessing_time += (now - last_time)
+            last_time = now
     
     # end of epoch; finalize
     progressBar.close()
     loss_total /= len(dataLoader)
     oa_total /= len(dataLoader)
+
+    print("Dataloader time in seconds:", "%.2f" % dataloader_time)
+    print("Model time in seconds:", "%.2f" % model_time)
+    print("Postprocessing time in seconds:", "%.2f" % postprocessing_time)
 
     return loss_total, oa_total
 
